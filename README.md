@@ -28,6 +28,7 @@ should open instantly, work offline, or avoid asking the server every time.
 - [Quick start](#quick-start)
 - [The shapes: DTO, Model, Entity](#the-shapes-dto-model-entity)
 - [Cookbook](#cookbook)
+- [Security](#security)
 - [Reference](#reference)
 - [Rules](#rules)
 - [Troubleshooting](#troubleshooting)
@@ -384,6 +385,97 @@ func makeTestRepository() -> (Repository<Trip>, StubHTTPClient) {
 
 ---
 
+## Security
+
+### What the package does for you
+
+| Risk | What happens |
+|---|---|
+| Traffic sent in the clear | **HTTPS only.** A plain `http://` request, including a full URL passed in an endpoint, is refused with `NetworkError.insecureConnection` before anything is sent. Only hosts you list in `SecurityPolicy.insecureHosts` (`.allowingLocalhost` for a dev server) may use HTTP. |
+| An API key or token sent to the wrong server | **Credentials only go to the API's own host** (and any `trustedHosts` you list). Default headers and interceptors are skipped for a request to any other host, such as a full URL for a file on a CDN. |
+| A redirect forwarding credentials | URLSession drops `Authorization` on a redirect to another host but **still forwards other headers**: an `X-Api-Key`, a cookie you set, custom headers (measured with a real pair of servers). The client strips everything except harmless headers (`Accept`, `Content-Type`, …) on a redirect to another host, and never follows a redirect from HTTPS to HTTP. |
+| Secrets in logs | The client never logs bodies or headers. Its log line shows the URL **without query values or user info** (`GET https://host/path?token&q=…`). |
+| Duplicate or repeated writes | POST and PATCH are not retried unless you opt in. A 401 refreshes the token once, not in a loop. |
+| Cached data readable on disk | `FileStore` sets a file-protection class (default: encrypted by the system until first unlock; `.complete` while the screen is locked), is excluded from backups, and can encrypt its contents (AES-GCM) with a key from the Keychain. A wrong key or a tampered file is discarded, never half-read. |
+| Tokens in the wrong place | `KeychainSecretStore` keeps secrets in the Keychain, this device only, instead of UserDefaults or files. |
+| Data left behind after sign-out | `repository.clear()`, `client.clearSession()` and `secretStore.setSecret(nil, …)`: see below. |
+
+```swift
+func makeSecureClient(auth: any AuthSession, apiKey: String) -> URLSessionHTTPClient {
+    #if DEBUG
+        // A local development server over plain HTTP. Never in a release build.
+        return URLSessionHTTPClient(baseURL: URL(string: "http://localhost:3000")!, security: .allowingLocalhost)
+    #else
+        return URLSessionHTTPClient(
+            baseURL: URL(string: "https://api.example.com/v1")!,
+            defaultHeaders: ["X-Api-Key": apiKey],            // sent to api.example.com only
+            interceptors: [BearerTokenInterceptor(token: { await auth.accessToken() })],
+            security: SecurityPolicy(trustedHosts: ["uploads.example.com"])   // may get them too
+        )
+    #endif
+}
+```
+
+An encrypted, locked-when-the-screen-is-locked cache for data that is personal:
+
+```swift
+func makeSecureTripsRepository(client: any HTTPClient) async throws -> Repository<Trip> {
+    let secrets = KeychainSecretStore(service: "com.example.app")
+    let key = try await secrets.encryptionKey(named: "trips-cache")   // created once, kept in the Keychain
+    return Repository(
+        remote: RESTRemoteSource(client: client, path: "trips", mapper: TripMapper()),
+        store: FileStore<Trip>(name: "trips", protection: .complete, encryptionKey: key)
+    )
+}
+```
+
+On sign-out, clear all three places something can be left behind:
+
+```swift
+func signOut(
+    client: URLSessionHTTPClient,
+    repositories: [Repository<Trip>],
+    secrets: any SecretStore
+) async throws {
+    for repository in repositories { try await repository.clear() }   // cached data
+    await client.clearSession()                                       // cookies and credentials held by URLSession
+    try await secrets.setSecret(nil, for: "refresh-token")            // tokens your own code stored
+}
+```
+
+### What your app still has to do
+
+The package can't do these for you; they live in your app's settings and code.
+
+- **Keep App Transport Security on.** Don't set `NSAllowsArbitraryLoads` in
+  Info.plist. If one host really can't use HTTPS, add an
+  `NSExceptionDomains` entry for just that host.
+- **Never override certificate checks.** Don't answer a server-trust challenge
+  with `URLCredential(trust: serverTrust)` unless you have first evaluated the
+  trust (`SecTrustEvaluateWithError`), and don't call `SecTrustSetExceptions`.
+  Both make the app accept any certificate. Putting them behind `#if DEBUG` is
+  risky: a build setting that isn't defined, or a flag that leaks into a release
+  configuration, ships them. For a local server use `.allowingLocalhost`.
+- **Keep tokens in the Keychain** (your sign-in SDK usually does this for you).
+  Never in UserDefaults, files, or the URL.
+- **Don't put secrets in query strings.** URLs end up in logs, proxies and
+  crash reports. Use headers or the body.
+- **Sign-out clears everything** (the snippet above), including cached data.
+- **Sensitive screens:** hide the app preview in the app switcher, and
+  consider blocking screenshots, for screens showing payment or personal data.
+  Not covered here.
+
+### Certificate pinning
+
+Not included. Pinning ties the app to one server key, so a rotated or
+replaced certificate locks every user out until they update. If you need it,
+pin the **public key of your CA or a backup key**, not the leaf certificate,
+and ship a way to turn it off remotely. Pass a `URLSession` that has your
+trust delegate to `URLSessionHTTPClient(session:)`; the delegate must call
+`SecTrustEvaluateWithError` first and then compare the key.
+
+---
+
 ## Reference
 
 ### Types
@@ -400,7 +492,9 @@ func makeTestRepository() -> (Repository<Trip>, StubHTTPClient) {
 | Keep unknown fields | `WithExtras<DTO>` + `UnknownFieldPreserving` |
 | Convert server ⇄ app | `Mapper`, `ClosureMapper`, `IdentityMapper` |
 | Fetch models | `RemoteSource`, `WritableRemoteSource`, `RESTRemoteSource` |
-| Keep models | `Store`, `InMemoryStore`, `FileStore` |
+| Keep models | `Store`, `InMemoryStore`, `FileStore` (protected; optionally encrypted) |
+| Keep secrets | `SecretStore`, `KeychainSecretStore`, `InMemorySecretStore` |
+| HTTPS-only and credential scoping | `SecurityPolicy` |
 | The one object for a screen | `Repository<Model>` + `CachePolicy` |
 | Resolve conflicts | `ConflictResolver` + `Syncable` |
 
@@ -417,6 +511,7 @@ func makeTestRepository() -> (Repository<Trip>, StubHTTPClient) {
 | `.server(status:message:)` | 5xx | "Something went wrong", with retry |
 | `.decoding(String)` | The reply didn't match the DTO; the text names the field | Log it; it's a bug |
 | `.cancelled` | The task was cancelled | Ignore |
+| `.insecureConnection` | A request would have gone over plain HTTP (see `SecurityPolicy`) | A bug in the URL or configuration; fix it, don't allow HTTP |
 | `.invalidURL`, `.invalidResponse`, `.unknown` | Rare | Generic error |
 
 `error.localizedDescription` gives English text; show your own copy for each
@@ -434,13 +529,16 @@ Do:
   default in the mapper.
 - Keep DTOs private to the API and mapper. Screens only see models.
 - Give a repository to one kind of data, with one store name (`FileStore(name:)`).
-- Clear every repository on sign-out.
+- Clear every repository, the client session and your stored tokens on sign-out.
+- Keep the default `SecurityPolicy` in release builds.
 
 Don't:
 - Don't decode DTOs in a view model, or put `URLSession` in one.
 - Don't share a store name between two kinds of data.
 - Don't retry POSTs unless the server de-duplicates them.
 - Don't log request bodies or headers. The client doesn't; keep it that way.
+- Don't answer server-trust challenges with an unevaluated trust, and don't
+  disable App Transport Security (see [Security](#security)).
 - Don't put an entity (database type) outside its store adapter.
 
 ---
@@ -474,6 +572,8 @@ them, so they get designed against a real case:
 - **Database stores** (SwiftData, Realm, Core Data). Write one as a `Store`
   adapter in your app; if two projects want the same one, it becomes an
   optional add-on package so this one stays dependency-free.
+- **Certificate pinning, jailbreak detection, screenshot blocking.** See
+  [Security](#security) for pinning guidance.
 - **Network reachability monitoring.** `error.isOffline` tells you after the
   fact; add `NWPathMonitor` in your app if you need to know beforehand.
 
@@ -497,6 +597,8 @@ Apps pin a version and update on purpose.
   - **Major:** something an app has to change.
 - Every release is listed in [CHANGELOG.md](CHANGELOG.md).
 - Before tagging: `swift test` passes (it runs on macOS), the tests also pass
-  on an iOS simulator, and the package builds for iOS.
+  on an iOS simulator, and the package builds for iOS. Anything that touches
+  credentials, redirects, logging or storage needs a test that fails without
+  the protection.
 - The repository stays project-neutral: no project names, domains or sample
   data from a real project in code, comments or tests.

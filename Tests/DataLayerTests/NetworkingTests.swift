@@ -4,17 +4,31 @@ import XCTest
 
 /// Replies to URLSession requests from a closure, so the real client runs
 /// without a network.
+struct StubReply: Sendable {
+    var status: Int
+    var body: String = ""
+    var headers: [String: String] = [:]
+}
+
 final class StubURLProtocol: URLProtocol, @unchecked Sendable {
-    typealias Handler = @Sendable (URLRequest) throws -> (status: Int, body: String)
+    typealias Handler = @Sendable (URLRequest) throws -> StubReply
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var handler: Handler?
     nonisolated(unsafe) private static var seen: [URLRequest] = []
 
-    static func install(_ handler: @escaping Handler) {
+    static func installReplies(_ handler: @escaping Handler) {
         lock.withLock {
             self.handler = handler
             seen = []
+        }
+    }
+
+    /// Shorthand for handlers that only return a status and a body.
+    static func install(_ handler: @escaping @Sendable (URLRequest) throws -> (Int, String)) {
+        installReplies { request in
+            let (status, body) = try handler(request)
+            return StubReply(status: status, body: body)
         }
     }
 
@@ -37,10 +51,27 @@ final class StubURLProtocol: URLProtocol, @unchecked Sendable {
         }
         do {
             guard let handler else { throw URLError(.unknown) }
-            let (status, body) = try handler(request)
-            let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+            let reply = try handler(request)
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: reply.status,
+                httpVersion: nil,
+                headerFields: reply.headers
+            )!
+            if (300..<400).contains(reply.status), let location = reply.headers["Location"].flatMap(URL.init(string:)) {
+                var redirected = URLRequest(url: location)
+                redirected.httpMethod = request.httpMethod
+                // What the real URLSession carries to another host: every header
+                // except Authorization (measured against a real server pair; it
+                // forwards X-Api-Key, Cookie and custom headers).
+                var headers = request.allHTTPHeaderFields ?? [:]
+                if redirected.url?.host != request.url?.host { headers["Authorization"] = nil }
+                redirected.allHTTPHeaderFields = headers
+                client?.urlProtocol(self, wasRedirectedTo: redirected, redirectResponse: response)
+                return
+            }
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: Data(body.utf8))
+            client?.urlProtocol(self, didLoad: Data(reply.body.utf8))
             client?.urlProtocolDidFinishLoading(self)
         } catch {
             client?.urlProtocol(self, didFailWithError: error)
@@ -232,6 +263,169 @@ final class NetworkingTests: XCTestCase {
         }
     }
 
+    // MARK: - Credentials stay with the API's own host
+
+    func testCredentialsAreNotCarriedToAnotherHostOnRedirect() async {
+        StubURLProtocol.installReplies { request in
+            request.url?.host == "api.example.com"
+                ? StubReply(status: 302, headers: ["Location": "https://files.example.net/download"])
+                : StubReply(status: 200, body: "[]")
+        }
+        let client = URLSessionHTTPClient(
+            baseURL: base,
+            session: StubURLProtocol.session(),
+            defaultHeaders: ["Accept": "application/json", "X-Api-Key": "key-123", "Cookie": "session=abc"],
+            interceptors: [BearerTokenInterceptor(token: { "secret-token" })]
+        )
+        _ = try? await client.send(.get("trips"))
+
+        let sent = StubURLProtocol.requests
+        XCTAssertEqual(sent.first?.value(forHTTPHeaderField: "X-Api-Key"), "key-123", "the API's own host gets them")
+        let followed = sent.first { $0.url?.host == "files.example.net" }
+        XCTAssertNotNil(followed, "a redirect to another host is followed")
+        for header in ["Authorization", "X-Api-Key", "Cookie"] {
+            XCTAssertNil(followed?.value(forHTTPHeaderField: header), "\(header) must not go to another host")
+        }
+        XCTAssertEqual(followed?.value(forHTTPHeaderField: "Accept"), "application/json", "harmless headers do")
+    }
+
+    func testRedirectToSameHostKeepsCredentials() async {
+        StubURLProtocol.installReplies { request in
+            request.url?.path == "/v1/old"
+                ? StubReply(status: 302, headers: ["Location": "https://api.example.com/v1/new"])
+                : StubReply(status: 200, body: "[]")
+        }
+        let client = makeClient(interceptors: [BearerTokenInterceptor(token: { "secret-token" })])
+        let _: [Trip] = try! await client.send(.get("old"))
+        let followed = StubURLProtocol.requests.last
+        XCTAssertEqual(followed?.url?.path, "/v1/new")
+        XCTAssertEqual(followed?.value(forHTTPHeaderField: "Authorization"), "Bearer secret-token")
+    }
+
+    func testARedirectFromHTTPSToHTTPIsNotFollowed() async {
+        StubURLProtocol.installReplies { request in
+            request.url?.scheme == "https"
+                ? StubReply(status: 302, headers: ["Location": "http://api.example.com/v1/plain"])
+                : StubReply(status: 200, body: "[]")
+        }
+        // The stub can't send the 3xx reply a real network stack returns when a
+        // redirect is declined, so the request ends by timing out. What this
+        // test checks is that nothing goes out over http.
+        let client = URLSessionHTTPClient(
+            baseURL: base,
+            session: StubURLProtocol.session(),
+            interceptors: [BearerTokenInterceptor(token: { "secret-token" })],
+            timeout: 0.5
+        )
+        do {
+            let _: [Trip] = try await client.send(.get("trips"))
+            XCTFail("should not succeed over http")
+        } catch {}
+        XCTAssertTrue(StubURLProtocol.requests.allSatisfy { $0.url?.scheme == "https" }, "no request went out over http")
+    }
+
+    func testPlainHTTPIsRefusedAndNothingIsSent() async {
+        StubURLProtocol.install { _ in (200, "[]") }
+        let client = URLSessionHTTPClient(baseURL: URL(string: "http://api.example.com/v1")!, session: StubURLProtocol.session())
+        do {
+            _ = try await client.send(.get("trips"))
+            XCTFail("should throw")
+        } catch {
+            XCTAssertEqual(error as? NetworkError, .insecureConnection)
+        }
+        XCTAssertTrue(StubURLProtocol.requests.isEmpty)
+    }
+
+    func testAFullHTTPURLIsRefusedEvenWithAnHTTPSBase() async {
+        StubURLProtocol.install { _ in (200, "[]") }
+        do {
+            _ = try await makeClient().send(.get("http://api.example.com/v1/trips"))
+            XCTFail("should throw")
+        } catch {
+            XCTAssertEqual(error as? NetworkError, .insecureConnection)
+        }
+    }
+
+    func testPlainHTTPToLocalhostIsAllowedOnlyWhenTheAppSaysSo() async throws {
+        StubURLProtocol.install { _ in (200, "[]") }
+        let local = URL(string: "http://localhost:8080")!
+        let strict = URLSessionHTTPClient(baseURL: local, session: StubURLProtocol.session())
+        do {
+            _ = try await strict.send(.get("trips"))
+            XCTFail("should throw")
+        } catch {
+            XCTAssertEqual(error as? NetworkError, .insecureConnection)
+        }
+        let dev = URLSessionHTTPClient(baseURL: local, session: StubURLProtocol.session(), security: .allowingLocalhost)
+        let trips: [Trip] = try await dev.send(.get("trips"))
+        XCTAssertEqual(trips, [])
+    }
+
+    func testCredentialsGoOnlyToTheAPIsOwnHost() async throws {
+        StubURLProtocol.install { _ in (200, "[]") }
+        let client = URLSessionHTTPClient(
+            baseURL: base,
+            session: StubURLProtocol.session(),
+            defaultHeaders: ["X-Api-Key": "key-123"],
+            interceptors: [BearerTokenInterceptor(token: { "secret-token" })]
+        )
+        let _: [Trip] = try await client.send(.get("trips"))
+        let _: [Trip] = try await client.send(.get("https://cdn.example.net/list.json"))
+
+        let own = StubURLProtocol.requests[0]
+        let other = StubURLProtocol.requests[1]
+        XCTAssertEqual(own.value(forHTTPHeaderField: "X-Api-Key"), "key-123")
+        XCTAssertEqual(own.value(forHTTPHeaderField: "Authorization"), "Bearer secret-token")
+        XCTAssertNil(other.value(forHTTPHeaderField: "X-Api-Key"), "a request to another host carries no key")
+        XCTAssertNil(other.value(forHTTPHeaderField: "Authorization"), "and no token")
+    }
+
+    func testAHostTheAppTrustsDoesGetCredentials() async throws {
+        StubURLProtocol.install { _ in (200, "[]") }
+        let client = URLSessionHTTPClient(
+            baseURL: base,
+            session: StubURLProtocol.session(),
+            interceptors: [BearerTokenInterceptor(token: { "secret-token" })],
+            security: SecurityPolicy(trustedHosts: ["Uploads.Example.com"])
+        )
+        let _: [Trip] = try await client.send(.get("https://uploads.example.com/list"))
+        XCTAssertEqual(StubURLProtocol.requests.first?.value(forHTTPHeaderField: "Authorization"), "Bearer secret-token")
+    }
+
+    func testLogsNeverContainQueryValuesCredentialsOrUserInfo() async throws {
+        StubURLProtocol.install { _ in (200, "[]") }
+        let lines = LogBox()
+        let client = URLSessionHTTPClient(
+            baseURL: base,
+            session: StubURLProtocol.session(),
+            interceptors: [BearerTokenInterceptor(token: { "secret-token" })],
+            log: { lines.add($0) }
+        )
+        let _: [Trip] = try await client.send(.get("trips", query: ["access_token": "abc123", "email": "dana@example.com"]))
+        _ = try? await client.send(.get("https://user:hunter2@cdn.example.net/x?sig=zzz"))
+
+        let all = lines.all.joined(separator: "\n")
+        XCTAssertFalse(all.isEmpty)
+        for secret in ["abc123", "dana@example.com", "secret-token", "hunter2", "zzz"] {
+            XCTAssertFalse(all.contains(secret), "\(secret) leaked into the log:\n\(all)")
+        }
+        XCTAssertTrue(all.contains("access_token"), "names are kept so a log is still useful")
+    }
+
+    func testClearSessionRemovesCookiesHeldBySession() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let url = URL(string: "https://api.example.com/v1")!
+        session.configuration.httpCookieStorage?.setCookie(
+            HTTPCookie(properties: [.name: "session", .value: "abc", .domain: "api.example.com", .path: "/"])!
+        )
+        XCTAssertEqual(session.configuration.httpCookieStorage?.cookies(for: url)?.count, 1)
+
+        await URLSessionHTTPClient(baseURL: url, session: session).clearSession()
+        XCTAssertEqual(session.configuration.httpCookieStorage?.cookies(for: url)?.count ?? 0, 0)
+    }
+
     func testRefreshFailureSurfacesUnauthorized() async {
         StubURLProtocol.install { _ in (401, "{}") }
         let client = makeClient(interceptors: [BearerTokenInterceptor(token: { "t" }, refresh: { false })])
@@ -262,4 +456,11 @@ final class Counter: @unchecked Sendable {
     private var count = 0
     /// Returns 0, 1, 2… on successive calls.
     func next() -> Int { lock.withLock { defer { count += 1 }; return count } }
+}
+
+final class LogBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [String] = []
+    func add(_ line: String) { lock.withLock { lines.append(line) } }
+    var all: [String] { lock.withLock { lines } }
 }

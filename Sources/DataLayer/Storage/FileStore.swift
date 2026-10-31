@@ -7,11 +7,26 @@
 //  is discarded and the store starts empty, since the server still has the
 //  data.
 //
+//  What's on disk is protected in three ways:
+//  - a file-protection class, so the system encrypts it while the device is
+//    locked (the default, "until first user authentication", still lets a
+//    background refresh run after the first unlock; use `.complete` to
+//    lock it whenever the screen is locked);
+//  - it's excluded from backups (the server is the backup);
+//  - optionally, you can encrypt the contents yourself with a key you keep
+//    in the Keychain (see `SecretStore.encryptionKey(named:)`). Do this when
+//    the cache holds personal data you wouldn't want readable from a device
+//    backup, a forensic copy or a jailbroken device.
+//
 
+import CryptoKit
 import Foundation
 
 public actor FileStore<Item: Codable & Sendable>: Store {
     private let url: URL
+    private let protection: FileProtectionType
+    private let excludeFromBackup: Bool
+    private let encryptionKey: SymmetricKey?
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
     private var list = StoredList<Item>()
@@ -23,11 +38,25 @@ public actor FileStore<Item: Codable & Sendable>: Store {
     ///   - directory: where to keep it. The default is the app's Caches
     ///     folder, which iOS may clear when space is low; pass
     ///     `.applicationSupportDirectory` for data that must stay.
-    public init(name: String, directory: URL? = nil) {
+    ///   - protection: the file-protection class (iOS and other device
+    ///     platforms; ignored on macOS).
+    ///   - excludeFromBackup: keep the file out of device backups.
+    ///   - encryptionKey: encrypt the contents (AES-GCM). A file written
+    ///     with a different key, or without one, is discarded.
+    public init(
+        name: String,
+        directory: URL? = nil,
+        protection: FileProtectionType = .completeUntilFirstUserAuthentication,
+        excludeFromBackup: Bool = true,
+        encryptionKey: SymmetricKey? = nil
+    ) {
         let folder = directory
             ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
                 .appendingPathComponent("DataLayer", isDirectory: true)
         url = folder.appendingPathComponent("\(name).json")
+        self.protection = protection
+        self.excludeFromBackup = excludeFromBackup
+        self.encryptionKey = encryptionKey
         encoder = JSONCoding.encoder()
         decoder = JSONCoding.decoder()
     }
@@ -79,15 +108,38 @@ public actor FileStore<Item: Codable & Sendable>: Store {
         continuations[id] = nil
     }
 
+    /// Marks a file as encrypted by this store.
+    private static var header: Data { Data("DL1".utf8) }
+
     private func load() {
         guard !isLoaded else { return }
         isLoaded = true
         guard let data = try? Data(contentsOf: url) else { return }
-        if let items = try? decoder.decode([Stored<Item>].self, from: data) {
+        if let json = open(data), let items = try? decoder.decode([Stored<Item>].self, from: json) {
             list = StoredList(items)
         } else {
             try? FileManager.default.removeItem(at: url)
         }
+    }
+
+    /// The JSON inside a file, or `nil` if it doesn't match how this store is
+    /// configured (wrong key, tampered, encrypted vs plain).
+    private func open(_ data: Data) -> Data? {
+        let isEncrypted = data.starts(with: Self.header)
+        guard let encryptionKey else { return isEncrypted ? nil : data }
+        guard isEncrypted,
+              let box = try? AES.GCM.SealedBox(combined: data.dropFirst(Self.header.count)),
+              let json = try? AES.GCM.open(box, using: encryptionKey)
+        else { return nil }
+        return json
+    }
+
+    private func seal(_ json: Data) throws -> Data {
+        guard let encryptionKey else { return json }
+        guard let combined = try AES.GCM.seal(json, using: encryptionKey).combined else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        return Self.header + combined
     }
 
     private func persist() throws {
@@ -95,7 +147,22 @@ public actor FileStore<Item: Codable & Sendable>: Store {
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try encoder.encode(list.all).write(to: url, options: .atomic)
+        var options: Data.WritingOptions = [.atomic]
+        #if os(iOS) || os(tvOS) || os(watchOS) || os(visionOS)
+            switch protection {
+            case .complete: options.insert(.completeFileProtection)
+            case .completeUnlessOpen: options.insert(.completeFileProtectionUnlessOpen)
+            case .none: options.insert(.noFileProtection)
+            default: options.insert(.completeFileProtectionUntilFirstUserAuthentication)
+            }
+        #endif
+        try seal(encoder.encode(list.all)).write(to: url, options: options)
+
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = excludeFromBackup
+        var file = url
+        try file.setResourceValues(values)
+
         let snapshot = list.all
         for continuation in continuations.values { continuation.yield(snapshot) }
     }

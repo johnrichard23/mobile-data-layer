@@ -11,6 +11,8 @@ import Foundation
 public enum NetworkError: Error, Equatable, Sendable {
     /// The URL couldn't be built.
     case invalidURL
+    /// The request would have gone over plain HTTP. See `SecurityPolicy`.
+    case insecureConnection
     /// No connection to the internet or the server.
     case noConnection
     /// The server took too long.
@@ -78,6 +80,7 @@ extension NetworkError: LocalizedError {
         if let message = serverMessage, !message.isEmpty { return message }
         switch self {
         case .invalidURL: return "The address is not valid."
+        case .insecureConnection: return "The connection isn't secure, so the request was not sent."
         case .noConnection: return "No internet connection."
         case .timeout: return "The server took too long to respond."
         case .cancelled: return "The request was cancelled."
